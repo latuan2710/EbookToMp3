@@ -7,6 +7,8 @@ import android.content.pm.ServiceInfo
 import android.net.Uri
 import android.os.Bundle
 import android.os.IBinder
+import android.os.SystemClock
+import android.provider.DocumentsContract
 import android.provider.MediaStore
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
@@ -22,78 +24,207 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.zip.ZipInputStream
 
+data class Progress(
+    val running: Boolean = false,
+    val percent: Int = 0,
+    val title: String = "Sẵn sàng",
+    val detail: String = "Chọn sách rồi bấm bắt đầu",
+    val startAt: Long = 0,
+    val etaAt: Long = -1,
+    val endAt: Long = 0,
+    val log: String = "",
+    val done: Boolean = false,
+    val error: Boolean = false
+)
+
+class OutFile(val os: OutputStream, private val onClose: () -> Unit) {
+    fun close() {
+        try { os.close() } catch (_: Exception) {}
+        onClose()
+    }
+}
+
 class ConvertService : Service() {
     companion object {
-        @Volatile var onUpdate: ((String, Int) -> Unit)? = null
+        @Volatile var listener: ((Progress) -> Unit)? = null
+        @Volatile var last: Progress? = null
+        @Volatile var cancel = false
+        @Volatile var running = false
     }
+
+    private val logLines = mutableListOf<String>()
+    private var startAt = 0L
 
     override fun onBind(i: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val i = intent ?: return START_NOT_STICKY
-        val uri = Uri.parse(i.getStringExtra("uri") ?: return START_NOT_STICKY)
-        val lang = i.getStringExtra("lang") ?: "vi"
         getSystemService(NotificationManager::class.java)
             .createNotificationChannel(NotificationChannel("cv", "Chuyển đổi", NotificationManager.IMPORTANCE_LOW))
-        ServiceCompat.startForeground(this, 1, notif("Đang chuẩn bị..."),
+        ServiceCompat.startForeground(this, 1, notif("Đang chuẩn bị...", 0, true),
             ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+
+        val i = intent
+        val uriStr = i?.getStringExtra("uri")
+        if (i == null || uriStr == null || running) { stopSelf(); return START_NOT_STICKY }
+        val uri = Uri.parse(uriStr)
+        val lang = i.getStringExtra("lang") ?: "vi"
+        val tree = i.getStringExtra("tree")?.let { Uri.parse(it) }
+        val merge = i.getBooleanExtra("merge", false)
+        val book = (i.getStringExtra("book") ?: "Sach")
+            .replace(Regex("[^\\p{L}\\p{N}_ -]"), "").trim().ifEmpty { "Sach" }.replace(' ', '_')
+
+        running = true
+        cancel = false
+        startAt = SystemClock.elapsedRealtime()
+        logLines.clear()
         Thread {
-            try { convert(uri, lang) } catch (e: Exception) { report("Lỗi: ${e.message}", 0) }
+            try {
+                convert(uri, lang, tree, merge, book)
+            } catch (e: Exception) {
+                fail("Lỗi: ${e.message}")
+            }
+            running = false
             stopSelf()
         }.start()
         return START_NOT_STICKY
     }
 
-    private fun notif(t: String) = Notification.Builder(this, "cv")
-        .setContentTitle(t).setSmallIcon(android.R.drawable.stat_sys_download).build()
-
-    private fun report(msg: String, p: Int) {
-        getSystemService(NotificationManager::class.java).notify(1, notif(msg))
-        onUpdate?.invoke(msg, p)
+    private fun notif(title: String, pct: Int, ongoing: Boolean, text: String = ""): Notification {
+        val pi = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
+        val b = Notification.Builder(this, "cv")
+            .setContentTitle(title).setContentText(text)
+            .setSmallIcon(if (ongoing) android.R.drawable.stat_sys_download else android.R.drawable.stat_sys_download_done)
+            .setContentIntent(pi).setOnlyAlertOnce(true)
+        if (ongoing) b.setProgress(100, pct, false).setOngoing(true) else b.setAutoCancel(true)
+        return b.build()
     }
 
-    private fun convert(uri: Uri, lang: String) {
-        val bytes = contentResolver.openInputStream(uri)!!.use { it.readBytes() }
-        val isZip = bytes.size > 3 && bytes[0] == 'P'.code.toByte() && bytes[1] == 'K'.code.toByte()
-        val chapters = if (isZip) epub(bytes) else listOf("1" to String(bytes))
-        val chunks = chapters.map { chunk(it.second) }
-        val total = chunks.sumOf { it.size }
-        if (total == 0) { report("Không đọc được nội dung sách", 0); return }
+    private fun log(s: String) {
+        logLines.add(s)
+        while (logLines.size > 6) logLines.removeAt(0)
+    }
 
-        val tts = initTts(lang)
-        if (tts == null) { report("Không khởi tạo được TTS hoặc máy chưa có giọng '$lang'", 0); return }
+    private fun emit(title: String, detail: String, pct: Int, etaAt: Long = -1, done: Boolean = false, error: Boolean = false) {
+        val now = SystemClock.elapsedRealtime()
+        val p = Progress(
+            running = !done && !error, percent = pct, title = title, detail = detail,
+            startAt = startAt, etaAt = etaAt, endAt = if (done || error) now else 0,
+            log = logLines.joinToString("\n"), done = done, error = error
+        )
+        last = p
+        listener?.invoke(p)
+        val nm = getSystemService(NotificationManager::class.java)
+        if (done || error) nm.notify(2, notif(title, pct, false, detail))
+        else nm.notify(1, notif(title, pct, true, detail))
+    }
 
-        var done = 0
-        chapters.indices.forEach { idx ->
-            val cs = chunks[idx]
-            if (cs.isEmpty()) return@forEach
+    private fun fail(msg: String) {
+        log(msg)
+        emit("Có lỗi", msg, last?.percent ?: 0, error = true)
+    }
+
+    private fun openOut(name: String, tree: Uri?): OutFile {
+        if (tree == null) {
             val values = ContentValues().apply {
-                put(MediaStore.Audio.Media.DISPLAY_NAME, "Sach_Chuong_%03d.mp3".format(idx + 1))
+                put(MediaStore.Audio.Media.DISPLAY_NAME, name)
                 put(MediaStore.Audio.Media.MIME_TYPE, "audio/mpeg")
                 put(MediaStore.Audio.Media.RELATIVE_PATH, "Music/EbookMp3")
                 put(MediaStore.Audio.Media.IS_PENDING, 1)
             }
             val item = contentResolver.insert(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, values)!!
-            contentResolver.openOutputStream(item)!!.use { os ->
-                var lame: AndroidLame? = null
-                for (c in cs) {
-                    val wav = File(cacheDir, "t.wav"); wav.delete()
-                    if (synth(tts, c, wav)) lame = encode(wav, lame, os)
-                    done++
-                    report("Chương ${idx + 1}/${chapters.size}", done * 100 / total)
+            return OutFile(contentResolver.openOutputStream(item)!!) {
+                val v = ContentValues().apply { put(MediaStore.Audio.Media.IS_PENDING, 0) }
+                contentResolver.update(item, v, null, null)
+            }
+        }
+        val dir = DocumentsContract.buildDocumentUriUsingTree(tree, DocumentsContract.getTreeDocumentId(tree))
+        val doc = DocumentsContract.createDocument(contentResolver, dir, "audio/mpeg", name)!!
+        return OutFile(contentResolver.openOutputStream(doc)!!) {}
+    }
+
+    private fun finishFile(lame: AndroidLame?, out: OutFile) {
+        try {
+            lame?.let {
+                val b = ByteArray(7200)
+                val n = it.flush(b)
+                if (n > 0) out.os.write(b, 0, n)
+                it.close()
+            }
+        } finally {
+            out.close()
+        }
+    }
+
+    private fun convert(uri: Uri, lang: String, tree: Uri?, merge: Boolean, book: String) {
+        emit("Đang đọc sách...", "", 0)
+        log("Đọc file sách...")
+        val bytes = contentResolver.openInputStream(uri)!!.use { it.readBytes() }
+        val isZip = bytes.size > 3 && bytes[0] == 'P'.code.toByte() && bytes[1] == 'K'.code.toByte()
+        val chapters = if (isZip) epub(bytes) else listOf("1" to String(bytes))
+        val chunks = chapters.map { chunk(it.second) }
+        val totalChars = chunks.sumOf { c -> c.sumOf { it.length } }
+        if (totalChars == 0) { fail("Không đọc được nội dung sách"); return }
+        val nCh = chapters.size
+        log("Tìm thấy $nCh chương, $totalChars ký tự")
+
+        emit("Khởi tạo giọng đọc...", "Ngôn ngữ: $lang", 0)
+        val tts = initTts(lang)
+        if (tts == null) {
+            fail("Máy chưa có giọng '$lang'. Hãy cài Google Text-to-speech và tải giọng này.")
+            return
+        }
+
+        val loc = if (tree == null) "Music/EbookMp3" else (tree.lastPathSegment ?: "thư mục đã chọn")
+        var doneChars = 0
+        var files = 0
+        var out: OutFile? = null
+        var lame: AndroidLame? = null
+        try {
+            if (merge) out = openOut("$book.mp3", tree)
+            loop@ for (idx in chapters.indices) {
+                val cs = chunks[idx]
+                if (cs.isEmpty()) continue
+                if (!merge) {
+                    out = openOut("%s_Chuong_%03d.mp3".format(book, idx + 1), tree)
+                    lame = null
                 }
-                lame?.let {
-                    val b = ByteArray(7200)
-                    val n = it.flush(b)
-                    if (n > 0) os.write(b, 0, n)
-                    it.close()
+                for ((k, c) in cs.withIndex()) {
+                    if (cancel) break@loop
+                    val now = SystemClock.elapsedRealtime()
+                    val eta = if (doneChars > 0) now + (now - startAt) * (totalChars - doneChars) / doneChars else -1L
+                    emit(
+                        "Chương ${idx + 1}/$nCh",
+                        "Đoạn ${k + 1}/${cs.size} • $doneChars/$totalChars ký tự",
+                        (doneChars * 100L / totalChars).toInt(), eta
+                    )
+                    val wav = File(cacheDir, "t.wav")
+                    wav.delete()
+                    if (synth(tts, c, wav)) lame = encode(wav, lame, out!!.os)
+                    else log("Bỏ qua một đoạn bị lỗi")
+                    doneChars += c.length
+                }
+                if (!merge) {
+                    finishFile(lame, out!!)
+                    out = null
+                    lame = null
+                    files++
+                    log("Xong chương ${idx + 1}")
                 }
             }
-            values.clear(); values.put(MediaStore.Audio.Media.IS_PENDING, 0)
-            contentResolver.update(item, values, null, null)
+        } finally {
+            val o = out
+            if (o != null) { finishFile(lame, o); files++ }
+            tts.shutdown()
         }
-        tts.shutdown()
-        report("Xong! File nằm trong Music/EbookMp3", 100)
+
+        val pct = (doneChars * 100L / totalChars).toInt()
+        if (cancel) {
+            log("Đã huỷ theo yêu cầu")
+            emit("Đã huỷ", "Đã lưu $files file mp3 (một phần) tại: $loc", pct, done = true)
+        } else {
+            log("Hoàn tất")
+            emit("Hoàn tất", "Đã lưu $files file mp3 tại: $loc", 100, done = true)
+        }
     }
 
     private fun initTts(lang: String): TextToSpeech? {
