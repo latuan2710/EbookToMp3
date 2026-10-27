@@ -20,5 +20,5 @@ android {
 }
 dependencies {
     implementation("androidx.core:core-ktx:1.12.0")
-    implementation("com.github.naman14:TAndroidLame:1.1")
+    implementation("com.github.naman14:TAndroidLame:1.1") { exclude(group = "com.android.support") }
 }
