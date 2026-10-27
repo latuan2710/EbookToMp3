@@ -15,6 +15,7 @@ import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.provider.OpenableColumns
+import android.text.InputType
 import android.view.View
 import android.view.ViewGroup
 import android.widget.*
@@ -37,7 +38,7 @@ class MainActivity : Activity() {
     private lateinit var tvFile: TextView
     private lateinit var tvOut: TextView
     private lateinit var etLang: EditText
-    private lateinit var modeGroup: RadioGroup
+    private lateinit var etGroup: EditText
     private lateinit var seek: SeekBar
     private lateinit var tvSpeed: TextView
     private lateinit var tvPercent: TextView
@@ -142,13 +143,16 @@ class MainActivity : Activity() {
             setPadding(dp(14), dp(10), dp(14), dp(10))
         }
         c2.addView(etLang, LinearLayout.LayoutParams(MATCH, WRAP))
-        c2.addView(label("Cách xuất file mp3", 13f, MUT).apply { setPadding(0, dp(14), 0, dp(2)) })
-        modeGroup = RadioGroup(this).apply { orientation = RadioGroup.VERTICAL }
-        val r1 = RadioButton(this).apply { id = 1; text = "Mỗi chương một file mp3"; setTextColor(TXT); buttonTintList = ColorStateList.valueOf(ACC) }
-        val r2 = RadioButton(this).apply { id = 2; text = "Gộp cả sách thành một file mp3"; setTextColor(TXT); buttonTintList = ColorStateList.valueOf(ACC) }
-        modeGroup.addView(r1); modeGroup.addView(r2)
-        modeGroup.check(1)
-        c2.addView(modeGroup)
+        c2.addView(label("Gộp mỗi bao nhiêu chương thành 1 file mp3", 13f, MUT).apply { setPadding(0, dp(14), 0, dp(4)) })
+        etGroup = EditText(this).apply {
+            setText("1"); textSize = 15f; setTextColor(TXT)
+            inputType = InputType.TYPE_CLASS_NUMBER
+            setSingleLine(true)
+            background = rounded(Color.parseColor("#F3F4F6"), 10)
+            setPadding(dp(14), dp(10), dp(14), dp(10))
+        }
+        c2.addView(etGroup, LinearLayout.LayoutParams(MATCH, WRAP))
+        c2.addView(label("1 = mỗi chương một file • 0 = gộp cả sách. Tên file ghi rõ khoảng chương, ví dụ Sach_Chuong_001-005.mp3", 12f, MUT).apply { setPadding(0, dp(4), 0, 0) })
         c2.addView(label("Tốc độ đọc", 13f, MUT).apply { setPadding(0, dp(14), 0, dp(2)) })
         tvSpeed = label("1.0x (bình thường)", 14f, TXT)
         seek = SeekBar(this).apply {
@@ -218,7 +222,7 @@ class MainActivity : Activity() {
             val i = Intent(this, ConvertService::class.java)
                 .putExtra("uri", u.toString())
                 .putExtra("lang", etLang.text.toString().trim().ifEmpty { "vi" })
-                .putExtra("merge", modeGroup.checkedRadioButtonId == 2)
+                .putExtra("group", etGroup.text.toString().trim().toIntOrNull() ?: 1)
                 .putExtra("book", book)
                 .putExtra("rate", 0.5f + seek.progress * 0.1f)
             tree?.let { i.putExtra("tree", it.toString()) }

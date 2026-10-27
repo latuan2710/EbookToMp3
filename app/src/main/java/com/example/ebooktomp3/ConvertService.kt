@@ -69,7 +69,7 @@ class ConvertService : Service() {
         val uri = Uri.parse(uriStr)
         val lang = i.getStringExtra("lang") ?: "vi"
         val tree = i.getStringExtra("tree")?.let { Uri.parse(it) }
-        val merge = i.getBooleanExtra("merge", false)
+        val group = i.getIntExtra("group", 1)
         val rate = i.getFloatExtra("rate", 1.0f)
         val book = (i.getStringExtra("book") ?: "Sach")
             .replace(Regex("[^\\p{L}\\p{N}_ -]"), "").trim().ifEmpty { "Sach" }.replace(' ', '_')
@@ -80,7 +80,7 @@ class ConvertService : Service() {
         logLines.clear()
         Thread {
             try {
-                convert(uri, lang, tree, merge, book, rate)
+                convert(uri, lang, tree, group, book, rate)
             } catch (e: Exception) {
                 fail("Lỗi: ${e.message}")
             }
@@ -156,7 +156,7 @@ class ConvertService : Service() {
         }
     }
 
-    private fun convert(uri: Uri, lang: String, tree: Uri?, merge: Boolean, book: String, rate: Float) {
+    private fun convert(uri: Uri, lang: String, tree: Uri?, group: Int, book: String, rate: Float) {
         emit("Đang đọc sách...", "", 0)
         log("Đọc file sách...")
         val bytes = contentResolver.openInputStream(uri)!!.use { it.readBytes() }
@@ -183,36 +183,38 @@ class ConvertService : Service() {
         var out: OutFile? = null
         var lame: AndroidLame? = null
         try {
-            if (merge) out = openOut("$book.mp3", tree)
-            loop@ for (idx in chapters.indices) {
-                val cs = chunks[idx]
-                if (cs.isEmpty()) continue
-                if (!merge) {
-                    out = openOut("%s_Chuong_%03d.mp3".format(book, idx + 1), tree)
-                    lame = null
+            val valid = chapters.indices.filter { chunks[it].isNotEmpty() }
+            val groups = valid.chunked(maxOf(1, if (group <= 0) valid.size else group))
+            loop@ for ((gi, g) in groups.withIndex()) {
+                val a = g.first() + 1
+                val z = g.last() + 1
+                val name = if (a == z) "%s_Chuong_%03d.mp3".format(book, a)
+                else "%s_Chuong_%03d-%03d.mp3".format(book, a, z)
+                out = openOut(name, tree)
+                lame = null
+                for (idx in g) {
+                    val cs = chunks[idx]
+                    for ((k, c) in cs.withIndex()) {
+                        if (cancel) break@loop
+                        val now = SystemClock.elapsedRealtime()
+                        val eta = if (doneChars > 0) now + (now - startAt) * (totalChars - doneChars) / doneChars else -1L
+                        emit(
+                            "Chương ${idx + 1}/$nCh",
+                            "File ${gi + 1}/${groups.size} • Đoạn ${k + 1}/${cs.size} • $doneChars/$totalChars ký tự",
+                            (doneChars * 100L / totalChars).toInt(), eta
+                        )
+                        val wav = File(cacheDir, "t.wav")
+                        wav.delete()
+                        if (synth(tts, c, wav)) lame = encode(wav, lame, out!!.os)
+                        else log("Bỏ qua một đoạn bị lỗi")
+                        doneChars += c.length
+                    }
                 }
-                for ((k, c) in cs.withIndex()) {
-                    if (cancel) break@loop
-                    val now = SystemClock.elapsedRealtime()
-                    val eta = if (doneChars > 0) now + (now - startAt) * (totalChars - doneChars) / doneChars else -1L
-                    emit(
-                        "Chương ${idx + 1}/$nCh",
-                        "Đoạn ${k + 1}/${cs.size} • $doneChars/$totalChars ký tự",
-                        (doneChars * 100L / totalChars).toInt(), eta
-                    )
-                    val wav = File(cacheDir, "t.wav")
-                    wav.delete()
-                    if (synth(tts, c, wav)) lame = encode(wav, lame, out!!.os)
-                    else log("Bỏ qua một đoạn bị lỗi")
-                    doneChars += c.length
-                }
-                if (!merge) {
-                    finishFile(lame, out!!)
-                    out = null
-                    lame = null
-                    files++
-                    log("Xong chương ${idx + 1}")
-                }
+                finishFile(lame, out!!)
+                out = null
+                lame = null
+                files++
+                log("Xong $name")
             }
         } finally {
             val o = out
