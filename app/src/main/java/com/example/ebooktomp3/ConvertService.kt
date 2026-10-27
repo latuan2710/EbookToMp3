@@ -295,21 +295,79 @@ class ConvertService : Service() {
         return lame
     }
 
+    private fun isHtml(n: String): Boolean {
+        val l = n.lowercase()
+        return l.endsWith(".xhtml") || l.endsWith(".html") || l.endsWith(".htm")
+    }
+
+    private fun naturalCompare(a: String, b: String): Int {
+        val ra = Regex("\\d+|\\D+").findAll(a.lowercase()).map { it.value }.toList()
+        val rb = Regex("\\d+|\\D+").findAll(b.lowercase()).map { it.value }.toList()
+        var i = 0
+        while (i < ra.size && i < rb.size) {
+            val x = ra[i]
+            val y = rb[i]
+            val c = if (x[0].isDigit() && y[0].isDigit())
+                (x.toLongOrNull() ?: 0L).compareTo(y.toLongOrNull() ?: 0L)
+            else x.compareTo(y)
+            if (c != 0) return c
+            i++
+        }
+        return ra.size.compareTo(rb.size)
+    }
+
+    // Thứ tự đọc thật của sách theo mục "spine" trong file .opf
+    private fun spineOrder(files: Map<String, ByteArray>): List<String>? {
+        try {
+            val cont = files["META-INF/container.xml"]?.let { String(it) } ?: return null
+            val opfPath = Regex("full-path=\"([^\"]+)\"").find(cont)?.groupValues?.get(1) ?: return null
+            val opf = files[opfPath]?.let { String(it) } ?: return null
+            val dir = opfPath.substringBeforeLast('/', "")
+            val items = HashMap<String, String>()
+            val skip = HashSet<String>()
+            for (m in Regex("<item\\b[^>]*>", RegexOption.IGNORE_CASE).findAll(opf)) {
+                val tag = m.value
+                val id = Regex("\\bid=\"([^\"]*)\"").find(tag)?.groupValues?.get(1) ?: continue
+                val href = Regex("\\bhref=\"([^\"]*)\"").find(tag)?.groupValues?.get(1) ?: continue
+                val clean = Uri.decode(href.substringBefore('#'))
+                val full = File(if (dir.isEmpty()) clean else "$dir/$clean").normalize().path
+                items[id] = full
+                if (Regex("properties=\"[^\"]*\\bnav\\b").containsMatchIn(tag)) skip.add(id)
+            }
+            val order = mutableListOf<String>()
+            for (m in Regex("<itemref\\b[^>]*>", RegexOption.IGNORE_CASE).findAll(opf)) {
+                val id = Regex("idref=\"([^\"]*)\"").find(m.value)?.groupValues?.get(1) ?: continue
+                if (id in skip) continue
+                val path = items[id] ?: continue
+                if (files.containsKey(path) && !order.contains(path)) order.add(path)
+            }
+            return if (order.isEmpty()) null else order
+        } catch (e: Exception) {
+            return null
+        }
+    }
+
     private fun epub(b: ByteArray): List<Pair<String, String>> {
-        val m = sortedMapOf<String, String>()
+        val files = LinkedHashMap<String, ByteArray>()
         ZipInputStream(ByteArrayInputStream(b)).use { z ->
             var e = z.nextEntry
             while (e != null) {
-                val n = e.name.lowercase()
-                if (n.endsWith(".xhtml") || n.endsWith(".html") || n.endsWith(".htm")) {
-                    val t = Html.fromHtml(String(z.readBytes()), Html.FROM_HTML_MODE_LEGACY)
-                        .toString().replace("\uFFFC", "")
-                    if (t.trim().length > 200) m[e.name] = t
-                }
+                val n = e.name
+                if (!e.isDirectory && (isHtml(n) || n.lowercase().endsWith(".opf") || n.endsWith("container.xml")))
+                    files[n] = z.readBytes()
                 e = z.nextEntry
             }
         }
-        return m.toList()
+        val ordered = spineOrder(files)
+            ?: files.keys.filter { isHtml(it) }.sortedWith { x, y -> naturalCompare(x, y) }
+        val result = mutableListOf<Pair<String, String>>()
+        for (name in ordered) {
+            val data = files[name] ?: continue
+            val t = Html.fromHtml(String(data), Html.FROM_HTML_MODE_LEGACY)
+                .toString().replace("\uFFFC", "")
+            if (t.trim().length > 200) result.add(name to t)
+        }
+        return result
     }
 
     private fun chunk(t: String): List<String> {
