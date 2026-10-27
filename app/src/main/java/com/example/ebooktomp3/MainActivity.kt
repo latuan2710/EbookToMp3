@@ -38,6 +38,8 @@ class MainActivity : Activity() {
     private lateinit var tvOut: TextView
     private lateinit var etLang: EditText
     private lateinit var modeGroup: RadioGroup
+    private lateinit var seek: SeekBar
+    private lateinit var tvSpeed: TextView
     private lateinit var tvPercent: TextView
     private lateinit var bar: ProgressBar
     private lateinit var tvTitle: TextView
@@ -147,6 +149,24 @@ class MainActivity : Activity() {
         modeGroup.addView(r1); modeGroup.addView(r2)
         modeGroup.check(1)
         c2.addView(modeGroup)
+        c2.addView(label("Tốc độ đọc", 13f, MUT).apply { setPadding(0, dp(14), 0, dp(2)) })
+        tvSpeed = label("1.0x (bình thường)", 14f, TXT)
+        seek = SeekBar(this).apply {
+            max = 15
+            progress = 5
+            progressTintList = ColorStateList.valueOf(ACC)
+            thumbTintList = ColorStateList.valueOf(ACC)
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) {
+                    val r = 0.5f + p * 0.1f
+                    tvSpeed.text = "%.1fx".format(r) + if (p == 5) " (bình thường)" else ""
+                }
+                override fun onStartTrackingTouch(s: SeekBar?) {}
+                override fun onStopTrackingTouch(s: SeekBar?) {}
+            })
+        }
+        c2.addView(tvSpeed)
+        c2.addView(seek, LinearLayout.LayoutParams(MATCH, WRAP))
         c2.addView(label("Nơi lưu file", 13f, MUT).apply { setPadding(0, dp(14), 0, dp(2)) })
         tvOut = label("Music/EbookMp3 (mặc định)", 14f, TXT)
         c2.addView(tvOut)
@@ -200,6 +220,7 @@ class MainActivity : Activity() {
                 .putExtra("lang", etLang.text.toString().trim().ifEmpty { "vi" })
                 .putExtra("merge", modeGroup.checkedRadioButtonId == 2)
                 .putExtra("book", book)
+                .putExtra("rate", 0.5f + seek.progress * 0.1f)
             tree?.let { i.putExtra("tree", it.toString()) }
             render(Progress(running = true, title = "Đang khởi động...", detail = "", startAt = SystemClock.elapsedRealtime()))
             startForegroundService(i)

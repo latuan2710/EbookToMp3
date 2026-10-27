@@ -70,6 +70,7 @@ class ConvertService : Service() {
         val lang = i.getStringExtra("lang") ?: "vi"
         val tree = i.getStringExtra("tree")?.let { Uri.parse(it) }
         val merge = i.getBooleanExtra("merge", false)
+        val rate = i.getFloatExtra("rate", 1.0f)
         val book = (i.getStringExtra("book") ?: "Sach")
             .replace(Regex("[^\\p{L}\\p{N}_ -]"), "").trim().ifEmpty { "Sach" }.replace(' ', '_')
 
@@ -79,7 +80,7 @@ class ConvertService : Service() {
         logLines.clear()
         Thread {
             try {
-                convert(uri, lang, tree, merge, book)
+                convert(uri, lang, tree, merge, book, rate)
             } catch (e: Exception) {
                 fail("Lỗi: ${e.message}")
             }
@@ -155,7 +156,7 @@ class ConvertService : Service() {
         }
     }
 
-    private fun convert(uri: Uri, lang: String, tree: Uri?, merge: Boolean, book: String) {
+    private fun convert(uri: Uri, lang: String, tree: Uri?, merge: Boolean, book: String, rate: Float) {
         emit("Đang đọc sách...", "", 0)
         log("Đọc file sách...")
         val bytes = contentResolver.openInputStream(uri)!!.use { it.readBytes() }
@@ -174,6 +175,8 @@ class ConvertService : Service() {
             return
         }
 
+        tts.setSpeechRate(rate)
+        log("Tốc độ đọc: %.1fx".format(rate))
         val loc = if (tree == null) "Music/EbookMp3" else (tree.lastPathSegment ?: "thư mục đã chọn")
         var doneChars = 0
         var files = 0
