@@ -16,13 +16,20 @@
 - **Tiến trình đầy đủ**: phần trăm, sách/chương/đoạn đang đọc, số ký tự đã xử lý, thời gian đã chạy, thời gian còn lại ước tính, nhật ký, thông báo có thanh tiến độ.
 - Đọc EPUB **đúng thứ tự thật của sách** (theo spine trong file .opf), bỏ qua trang mục lục (nav).
 - **Wake lock**: giữ CPU thức trong lúc chuyển đổi nên tắt màn hình vẫn chạy ổn định, tự nhả khi hàng đợi xong hoặc khi dừng (tối đa 12 giờ). Nên cắm sạc khi đọc sách dài, và trên máy Xiaomi/Oppo/Samsung... hãy đặt pin của app ở chế độ "Không hạn chế".
+- **Thẻ ID3** trong mỗi file mp3: tên chương (ví dụ "Chương 1-5"), tên sách, số thứ tự file (3/12), nghệ sĩ và thể loại "Audiobook". Trình phát nhạc và app audiobook hiện đúng tên và xếp đúng thứ tự.
+- **Ảnh bìa** lấy từ EPUB (thẻ cover-image, meta cover hoặc file ảnh tên chứa "cover") được thu nhỏ rồi gắn vào thẻ ID3 của từng file mp3, trình phát sẽ hiện bìa sách.
+- **Điều khiển từ thông báo**: nút Tạm dừng/Tiếp tục và Dừng ngay trên thông báo, không cần mở app.
+- **Tiết kiệm RAM với sách lớn**: sách được chép vào cache theo luồng và mở bằng ZipFile, app phân tích trước (chỉ đếm ký tự từng chương) rồi mỗi lần chỉ nạp một chương, nên sách rất dài không còn nạp cả cuốn vào bộ nhớ. Bù lại, mỗi sách có thêm một bước phân tích ngắn trước khi đọc.
+- **Tạm dừng / Tiếp tục** ngay trong lúc đang chạy (khi tạm dừng sẽ nhả wake lock để đỡ tốn pin).
+- **Làm tiếp sau khi app bị tắt**: hàng đợi được lưu trên máy. Mở lại app sẽ thấy nút **Tiếp tục hàng đợi**, app bỏ qua các file mp3 đã xong của từng sách và làm lại file đang dở.
+- **Chọn giọng đọc** theo ngôn ngữ (chỉ liệt kê giọng offline đã cài) và nút **Nghe thử giọng** với đúng tốc độ đã chọn.
 - Luôn xuất ra **mp3** (mã hóa bằng LAME, 64 kbps).
 
 ## Cách dùng
 
 1. Cài giọng đọc tiếng Việt trong Google Text-to-speech (Cài đặt → Quản lý chung → Chuyển văn bản thành giọng nói).
 2. Mở app, cho phép thông báo, bấm **Chọn file EPUB / TXT** và chọn một hoặc nhiều sách.
-3. Chọn ngôn ngữ, số chương gộp mỗi file, chương bắt đầu, tốc độ đọc và thư mục lưu.
+3. Chọn ngôn ngữ, giọng đọc (bấm Nghe thử để kiểm tra), số chương gộp mỗi file, chương bắt đầu, tốc độ đọc và thư mục lưu.
 4. Bấm **Bắt đầu chuyển thành MP3**. Muốn thêm sách khi đang chạy: chọn thêm file rồi bấm **Thêm vào hàng đợi**.
 5. Có thể thoát app, việc chuyển đổi vẫn chạy nền.
 
@@ -50,13 +57,17 @@ app/src/main/java/com/example/ebooktomp3/
 ## Giới hạn hiện tại
 
 - Chưa hỗ trợ PDF.
-- Hàng đợi chỉ lưu trong bộ nhớ: nếu hệ thống tắt hẳn app thì hàng đợi mất, cần thêm lại.
+- Tạm dừng có hiệu lực giữa các đoạn đọc, có thể trễ vài chục giây vì đoạn đang đọc phải xong trước.
+- Làm tiếp sau khi bị tắt app theo đơn vị file mp3: file đang làm dở sẽ bị xoá và làm lại từ đầu file đó, các file đã xong được giữ nguyên.
 - Số "chương" dựa trên các file nội dung trong spine của EPUB, có thể nhiều hơn số chương in trong sách. Chưa đọc mục lục để gộp theo chương thật.
-- File TXT được xem là một chương duy nhất.
+- File TXT được xem là một chương duy nhất và vẫn được nạp cả file vào bộ nhớ.
+- Ảnh bìa chỉ có với EPUB có ảnh bìa; mỗi file mp3 mang theo một bản ảnh bìa nên dung lượng tăng thêm khoảng vài chục KB.
 - Từ Android 11, không chọn được thư mục gốc như Download hay Documents, hãy chọn thư mục con.
 
 ## Lịch sử thay đổi
 
+- **Cập nhật 11**: ảnh bìa trong thẻ ID3, nút Tạm dừng/Dừng trên thông báo, đọc sách theo từng chương để tiết kiệm RAM.
+- **Cập nhật 10**: thẻ ID3 cho file mp3, tạm dừng/tiếp tục, làm tiếp hàng đợi sau khi app bị tắt, chọn giọng đọc và nghe thử.
 - **Cập nhật 9**: thêm wake lock (quyền `WAKE_LOCK`) để việc chuyển đổi không bị chậm hoặc tạm dừng khi tắt màn hình.
 - **Cập nhật 8**: thêm tab "Danh sách" hiển thị sách đang đọc, sách đang chờ và các file mp3 đã xong (lưu lịch sử trên máy).
 - **Cập nhật 7**: thêm tuỳ chọn đọc từ chương n (bỏ qua các chương đứng trước, báo lỗi nếu n lớn hơn số chương của sách).

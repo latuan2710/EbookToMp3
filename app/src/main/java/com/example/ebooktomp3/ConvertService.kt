@@ -5,6 +5,9 @@ import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.drawable.Icon
 import android.net.Uri
 import android.os.Bundle
 import android.os.IBinder
@@ -25,7 +28,7 @@ import java.util.Locale
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
-import java.util.zip.ZipInputStream
+import java.util.zip.ZipFile
 
 object JobState {
     const val WAITING = 0
@@ -43,11 +46,14 @@ class BookJob(
     val group: Int,
     val startChapter: Int,
     val rate: Float,
-    val tree: String?
+    val tree: String?,
+    val voice: String? = null
 ) {
     @Volatile var status = JobState.WAITING
     @Volatile var percent = 0
     @Volatile var note = ""
+    @Volatile var doneGroups = 0
+    @Volatile var partialUri: String? = null
 }
 
 data class Progress(
@@ -70,10 +76,23 @@ data class DoneFile(
     val partial: Boolean
 )
 
-class OutFile(val os: OutputStream, private val onClose: () -> Unit) {
+class OutFile(val os: OutputStream, val uri: Uri, private val onClose: () -> Unit) {
     fun close() {
         try { os.close() } catch (_: Exception) {}
         onClose()
+    }
+}
+
+class BookSource(val zip: ZipFile?, val names: List<String>, private val txt: String?) {
+    fun text(i: Int): String {
+        val z = zip ?: return txt ?: ""
+        val e = z.getEntry(names[i]) ?: return ""
+        val raw = z.getInputStream(e).use { it.readBytes() }
+        return Html.fromHtml(String(raw), Html.FROM_HTML_MODE_LEGACY).toString().replace("\uFFFC", "")
+    }
+
+    fun close() {
+        try { zip?.close() } catch (_: Exception) {}
     }
 }
 
@@ -84,6 +103,7 @@ class ConvertService : Service() {
         @Volatile var cancel = false      // bỏ qua sách đang đọc
         @Volatile var stopAll = false     // dừng cả hàng đợi
         @Volatile var running = false
+        @Volatile var paused = false
         val jobs = CopyOnWriteArrayList<BookJob>()
         val lock = Any()
         val history = CopyOnWriteArrayList<DoneFile>()
@@ -122,12 +142,44 @@ class ConvertService : Service() {
             saveHistory(ctx)
         }
 
-        fun add(list: List<BookJob>) {
+        fun add(ctx: Context, list: List<BookJob>) {
             synchronized(lock) {
                 if (!running) {
                     jobs.removeAll { it.status != JobState.WAITING && it.status != JobState.RUNNING }
                 }
                 jobs.addAll(list)
+            }
+            saveQueue(ctx)
+        }
+
+        // Lưu hàng đợi để làm tiếp nếu app bị tắt giữa chừng
+        @Synchronized
+        fun saveQueue(ctx: Context) {
+            val txt = jobs.filter { it.status == JobState.WAITING || it.status == JobState.RUNNING }
+                .joinToString("\n") { j ->
+                    listOf(
+                        j.uri, j.name, j.book, j.lang, j.group.toString(), j.startChapter.toString(),
+                        j.rate.toString(), j.tree ?: "", j.voice ?: "", j.doneGroups.toString(), j.partialUri ?: ""
+                    ).joinToString("\t") { clean(it) }
+                }
+            ctx.getSharedPreferences("queue", Context.MODE_PRIVATE).edit().putString("lines", txt).apply()
+        }
+
+        @Synchronized
+        fun loadQueue(ctx: Context) {
+            if (running || jobs.isNotEmpty()) return
+            val txt = ctx.getSharedPreferences("queue", Context.MODE_PRIVATE).getString("lines", "") ?: ""
+            for (line in txt.split('\n')) {
+                if (line.isBlank()) continue
+                val p = line.split('\t')
+                if (p.size < 11) continue
+                val j = BookJob(
+                    p[0], p[1], p[2], p[3], p[4].toIntOrNull() ?: 1, p[5].toIntOrNull() ?: 1,
+                    p[6].toFloatOrNull() ?: 1f, p[7].ifEmpty { null }, p[8].ifEmpty { null }
+                )
+                j.doneGroups = p[9].toIntOrNull() ?: 0
+                j.partialUri = p[10].ifEmpty { null }
+                jobs.add(j)
             }
         }
     }
@@ -139,6 +191,15 @@ class ConvertService : Service() {
     private var lastLoc = ""
     @Volatile private var cur: BookJob? = null
     private var wl: PowerManager.WakeLock? = null
+    private var nTitle = ""
+    private var nPct = 0
+    private var nText = ""
+
+    private fun svcPi(action: String, code: Int): PendingIntent =
+        PendingIntent.getService(
+            this, code, Intent(this, ConvertService::class.java).setAction(action),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
 
     override fun onBind(i: Intent?): IBinder? = null
 
@@ -151,12 +212,36 @@ class ConvertService : Service() {
         wl = null
     }
 
+    private fun acquireWl() {
+        releaseWl()
+        wl = getSystemService(PowerManager::class.java)
+            .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "ebooktomp3:convert")
+            .apply {
+                setReferenceCounted(false)
+                acquire(12 * 60 * 60 * 1000L)
+            }
+    }
+
     override fun onDestroy() {
         synchronized(lock) { releaseWl() }
         super.onDestroy()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val act = intent?.action
+        if (act == "toggle_pause" || act == "stop_all") {
+            synchronized(lock) {
+                latestStartId = startId
+                if (running) {
+                    if (act == "toggle_pause") {
+                        paused = !paused
+                        getSystemService(NotificationManager::class.java)
+                            .notify(1, notif(nTitle, nPct, true, nText))
+                    } else stopAll = true
+                } else stopSelf(startId)
+            }
+            return START_NOT_STICKY
+        }
         getSystemService(NotificationManager::class.java)
             .createNotificationChannel(NotificationChannel("cv", "Chuyển đổi", NotificationManager.IMPORTANCE_LOW))
         ServiceCompat.startForeground(this, 1, notif("Đang chuẩn bị...", 0, true),
@@ -171,13 +256,8 @@ class ConvertService : Service() {
                 startAt = SystemClock.elapsedRealtime()
                 logLines.clear()
                 lastLoc = ""
-                releaseWl()
-                wl = getSystemService(PowerManager::class.java)
-                    .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "ebooktomp3:convert")
-                    .apply {
-                        setReferenceCounted(false)
-                        acquire(12 * 60 * 60 * 1000L)
-                    }
+                paused = false
+                acquireWl()
                 Thread { worker() }.start()
             } else if (!running) {
                 stopSelf(startId)
@@ -210,6 +290,7 @@ class ConvertService : Service() {
                 jobStart = SystemClock.elapsedRealtime()
                 cancel = false
                 log("Bắt đầu: ${job.name}")
+                saveQueue(applicationContext)
                 try {
                     convertJob(job)
                 } catch (t: Throwable) {
@@ -232,6 +313,7 @@ class ConvertService : Service() {
                         }
                     }
                 }
+                saveQueue(applicationContext)
             }
         } catch (t: Throwable) {
             synchronized(lock) {
@@ -247,6 +329,7 @@ class ConvertService : Service() {
     private fun emitFinal(done: Int, err: Int, canc: Int) {
         val stopped = stopAll
         stopAll = false
+        paused = false
         cur = null
         val d = buildString {
             append("Xong $done sách")
@@ -267,7 +350,26 @@ class ConvertService : Service() {
             .setContentTitle(title).setContentText(text)
             .setSmallIcon(if (ongoing) android.R.drawable.stat_sys_download else android.R.drawable.stat_sys_download_done)
             .setContentIntent(pi).setOnlyAlertOnce(true)
-        if (ongoing) b.setProgress(100, pct, false).setOngoing(true) else b.setAutoCancel(true)
+        if (ongoing) {
+            b.setProgress(100, pct, false).setOngoing(true)
+            nTitle = title
+            nPct = pct
+            nText = text
+            b.addAction(
+                Notification.Action.Builder(
+                    Icon.createWithResource(
+                        this, if (paused) android.R.drawable.ic_media_play else android.R.drawable.ic_media_pause
+                    ),
+                    if (paused) "Tiếp tục" else "Tạm dừng", svcPi("toggle_pause", 1)
+                ).build()
+            )
+            b.addAction(
+                Notification.Action.Builder(
+                    Icon.createWithResource(this, android.R.drawable.ic_menu_close_clear_cancel),
+                    "Dừng", svcPi("stop_all", 2)
+                ).build()
+            )
+        } else b.setAutoCancel(true)
         return b.build()
     }
 
@@ -305,14 +407,14 @@ class ConvertService : Service() {
                 put(MediaStore.Audio.Media.IS_PENDING, 1)
             }
             val item = contentResolver.insert(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, values)!!
-            return OutFile(contentResolver.openOutputStream(item)!!) {
+            return OutFile(contentResolver.openOutputStream(item)!!, item) {
                 val v = ContentValues().apply { put(MediaStore.Audio.Media.IS_PENDING, 0) }
                 contentResolver.update(item, v, null, null)
             }
         }
         val dir = DocumentsContract.buildDocumentUriUsingTree(tree, DocumentsContract.getTreeDocumentId(tree))
         val doc = DocumentsContract.createDocument(contentResolver, dir, "audio/mpeg", name)!!
-        return OutFile(contentResolver.openOutputStream(doc)!!) {}
+        return OutFile(contentResolver.openOutputStream(doc)!!, doc) {}
     }
 
     private fun finishFile(lame: AndroidLame?, out: OutFile) {
@@ -334,23 +436,53 @@ class ConvertService : Service() {
         val book = job.book.replace(Regex("[^\\p{L}\\p{N}_ -]"), "").trim().ifEmpty { "Sach" }.replace(' ', '_')
 
         emit("Đang đọc sách...", "", 0)
-        val bytes = contentResolver.openInputStream(uri)!!.use { it.readBytes() }
-        val isZip = bytes.size > 3 && bytes[0] == 'P'.code.toByte() && bytes[1] == 'K'.code.toByte()
-        val chapters = if (isZip) epub(bytes) else listOf("1" to String(bytes))
-        val chunks = chapters.map { chunk(it.second) }
-        val allChars = chunks.sumOf { c -> c.sumOf { it.length } }
-        if (allChars == 0) throw IllegalStateException("Không đọc được nội dung sách")
-        val nCh = chapters.size
+        // Chép sách vào cache theo luồng, không nạp cả file vào RAM
+        val tmp = File(cacheDir, "book.tmp")
+        tmp.delete()
+        contentResolver.openInputStream(uri)!!.use { i -> tmp.outputStream().use { o -> i.copyTo(o) } }
+        val src = openSource(tmp)
+        try {
+            runJob(job, src, tree, book)
+        } finally {
+            src.close()
+            tmp.delete()
+        }
+    }
+
+    private fun runJob(job: BookJob, src: BookSource, tree: Uri?, book: String) {
+        // Phân tích: chỉ đếm ký tự từng chương, không giữ văn bản trong RAM
+        val lens = IntArray(src.names.size)
+        for (i in src.names.indices) {
+            if (cancel || stopAll) {
+                job.status = JobState.CANCELED
+                log("Đã huỷ: ${job.name}")
+                return
+            }
+            if (i % 10 == 0) emit("Đang phân tích sách...", "Phần ${i + 1}/${src.names.size}", 0)
+            val t = src.text(i)
+            lens[i] = if (src.zip != null && t.trim().length <= 200) 0 else chunk(t).sumOf { it.length }
+        }
+        val kept = src.names.indices.filter { lens[it] > 0 }
+        if (kept.isEmpty()) throw IllegalStateException("Không đọc được nội dung sách")
+        val nCh = kept.size
         val startCh = maxOf(1, job.startChapter)
-        val valid = chapters.indices.filter { chunks[it].isNotEmpty() && it + 1 >= startCh }
+        val valid = kept.indices.filter { it + 1 >= startCh }
         if (valid.isEmpty())
             throw IllegalStateException("Sách chỉ có $nCh chương, không có chương nào từ chương $startCh trở đi")
-        val totalChars = valid.sumOf { i -> chunks[i].sumOf { it.length } }
+        val totalChars = valid.sumOf { lens[kept[it]] }
         log("${job.name}: $nCh chương, đọc từ chương $startCh ($totalChars ký tự)")
+        val cover = src.zip?.let { scaleCover(coverOf(it)) }
+        if (cover != null) log("Đã lấy ảnh bìa")
 
         emit("Khởi tạo giọng đọc...", "Ngôn ngữ: ${job.lang}", 0)
         val tts = initTts(job.lang)
             ?: throw IllegalStateException("Máy chưa có giọng '${job.lang}'. Hãy cài Google Text-to-speech và tải giọng này.")
+        job.voice?.let { vn ->
+            try {
+                tts.voices?.firstOrNull { it.name == vn }?.let { tts.setVoice(it) }
+            } catch (_: Exception) {
+            }
+        }
         tts.setSpeechRate(job.rate)
 
         val loc = if (tree == null) "Music/EbookMp3" else (tree.lastPathSegment ?: "thư mục đã chọn")
@@ -360,6 +492,7 @@ class ConvertService : Service() {
         var out: OutFile? = null
         var lame: AndroidLame? = null
         var openName = ""
+        cleanupPartial(job)
         try {
             val groups = valid.chunked(maxOf(1, if (job.group <= 0) valid.size else job.group))
             loop@ for ((gi, g) in groups.withIndex()) {
@@ -367,12 +500,24 @@ class ConvertService : Service() {
                 val z = g.last() + 1
                 val name = if (a == z) "%s_Chuong_%03d.mp3".format(book, a)
                 else "%s_Chuong_%03d-%03d.mp3".format(book, a, z)
-                out = openOut(name, tree)
+                if (gi < job.doneGroups) {
+                    for (idx in g) doneChars += lens[kept[idx]]
+                    continue
+                }
+                val opened = openOut(name, tree)
+                out = opened
                 openName = name
+                job.partialUri = opened.uri.toString()
+                saveQueue(applicationContext)
+                opened.os.write(
+                    id3Tag(if (a == z) "Chương $a" else "Chương $a-$z", job.book, "${gi + 1}/${groups.size}", cover)
+                )
                 lame = null
                 for (idx in g) {
-                    val cs = chunks[idx]
+                    val cs = chunk(src.text(kept[idx]))
                     for ((k, c) in cs.withIndex()) {
+                        if (cancel || stopAll) break@loop
+                        if (paused) waitWhilePaused((doneChars * 100L / totalChars).toInt())
                         if (cancel || stopAll) break@loop
                         val now = SystemClock.elapsedRealtime()
                         val eta = if (doneChars > 0) now + (now - jobStart) * (totalChars - doneChars) / doneChars else -1L
@@ -393,6 +538,9 @@ class ConvertService : Service() {
                 lame = null
                 files++
                 addDone(applicationContext, DoneFile(job.name, name, loc, false))
+                job.doneGroups = gi + 1
+                job.partialUri = null
+                saveQueue(applicationContext)
                 log("Xong $name")
             }
         } finally {
@@ -401,6 +549,7 @@ class ConvertService : Service() {
                 finishFile(lame, o)
                 files++
                 addDone(applicationContext, DoneFile(job.name, openName, loc, true))
+                job.partialUri = null
             }
             tts.shutdown()
         }
@@ -412,6 +561,75 @@ class ConvertService : Service() {
             job.percent = 100
             log("Xong: ${job.name} ($files file)")
         }
+    }
+
+    private fun waitWhilePaused(pct: Int) {
+        val t0 = SystemClock.elapsedRealtime()
+        emit("Đang tạm dừng", "Bấm Tiếp tục để đọc tiếp", pct)
+        synchronized(lock) { releaseWl() }
+        while (paused && !cancel && !stopAll) Thread.sleep(300)
+        synchronized(lock) { if (running) acquireWl() }
+        jobStart += SystemClock.elapsedRealtime() - t0
+    }
+
+    // Xoá file mp3 dở dang do app bị tắt giữa chừng lần trước
+    private fun cleanupPartial(job: BookJob) {
+        val u = job.partialUri ?: return
+        try {
+            val uri = Uri.parse(u)
+            if (uri.authority == "media") contentResolver.delete(uri, null, null)
+            else DocumentsContract.deleteDocument(contentResolver, uri)
+        } catch (_: Exception) {
+        }
+        job.partialUri = null
+    }
+
+    private fun id3Frame(id: String, text: String): ByteArray {
+        val txt = text.toByteArray(Charsets.UTF_16LE)
+        val size = 1 + 2 + txt.size
+        val bo = ByteArrayOutputStream()
+        bo.write(id.toByteArray(Charsets.US_ASCII))
+        bo.write(byteArrayOf((size ushr 24).toByte(), (size ushr 16).toByte(), (size ushr 8).toByte(), size.toByte()))
+        bo.write(byteArrayOf(0, 0))
+        bo.write(1)
+        bo.write(byteArrayOf(0xFF.toByte(), 0xFE.toByte()))
+        bo.write(txt)
+        return bo.toByteArray()
+    }
+
+    // Thẻ ID3v2.3: tên chương, tên sách, số thứ tự, thể loại
+    private fun id3Apic(img: ByteArray): ByteArray {
+        val mime = "image/jpeg".toByteArray(Charsets.US_ASCII)
+        val size = 1 + mime.size + 1 + 1 + 1 + img.size
+        val bo = ByteArrayOutputStream()
+        bo.write("APIC".toByteArray(Charsets.US_ASCII))
+        bo.write(byteArrayOf((size ushr 24).toByte(), (size ushr 16).toByte(), (size ushr 8).toByte(), size.toByte()))
+        bo.write(byteArrayOf(0, 0))
+        bo.write(0)
+        bo.write(mime)
+        bo.write(0)
+        bo.write(3)
+        bo.write(0)
+        bo.write(img)
+        return bo.toByteArray()
+    }
+
+    private fun id3Tag(title: String, album: String, track: String, cover: ByteArray?): ByteArray {
+        val frames = ByteArrayOutputStream()
+        frames.write(id3Frame("TIT2", title))
+        frames.write(id3Frame("TALB", album))
+        frames.write(id3Frame("TPE1", "Ebook to MP3"))
+        frames.write(id3Frame("TRCK", track))
+        frames.write(id3Frame("TCON", "Audiobook"))
+        if (cover != null) frames.write(id3Apic(cover))
+        val f = frames.toByteArray()
+        val n = f.size
+        val out = ByteArrayOutputStream()
+        out.write("ID3".toByteArray(Charsets.US_ASCII))
+        out.write(byteArrayOf(3, 0, 0))
+        out.write(byteArrayOf(((n shr 21) and 0x7F).toByte(), ((n shr 14) and 0x7F).toByte(), ((n shr 7) and 0x7F).toByte(), (n and 0x7F).toByte()))
+        out.write(f)
+        return out.toByteArray()
     }
 
     private fun initTts(lang: String): TextToSpeech? {
@@ -498,22 +716,44 @@ class ConvertService : Service() {
         return ra.size.compareTo(rb.size)
     }
 
+    private fun openSource(f: File): BookSource {
+        val isZip = f.inputStream().use { s ->
+            val h = ByteArray(2)
+            s.read(h) == 2 && h[0] == 'P'.code.toByte() && h[1] == 'K'.code.toByte()
+        }
+        if (!isZip) return BookSource(null, listOf("txt"), f.readText())
+        val z = ZipFile(f)
+        val order = spineOrder(z)
+            ?: z.entries().asSequence().map { it.name }.filter { isHtml(it) }.toList()
+                .sortedWith { x, y -> naturalCompare(x, y) }
+        return BookSource(z, order, null)
+    }
+
+    private fun readOpf(z: ZipFile): Pair<String, String>? {
+        val ce = z.getEntry("META-INF/container.xml") ?: return null
+        val cont = String(z.getInputStream(ce).use { it.readBytes() })
+        val opfPath = Regex("full-path=\"([^\"]+)\"").find(cont)?.groupValues?.get(1) ?: return null
+        val oe = z.getEntry(opfPath) ?: return null
+        return opfPath to String(z.getInputStream(oe).use { it.readBytes() })
+    }
+
+    private fun resolvePath(opfPath: String, href: String): String {
+        val dir = opfPath.substringBeforeLast('/', "")
+        val clean = Uri.decode(href.substringBefore('#'))
+        return File(if (dir.isEmpty()) clean else "$dir/$clean").normalize().path
+    }
+
     // Thứ tự đọc thật của sách theo mục "spine" trong file .opf
-    private fun spineOrder(files: Map<String, ByteArray>): List<String>? {
+    private fun spineOrder(z: ZipFile): List<String>? {
         try {
-            val cont = files["META-INF/container.xml"]?.let { String(it) } ?: return null
-            val opfPath = Regex("full-path=\"([^\"]+)\"").find(cont)?.groupValues?.get(1) ?: return null
-            val opf = files[opfPath]?.let { String(it) } ?: return null
-            val dir = opfPath.substringBeforeLast('/', "")
+            val (opfPath, opf) = readOpf(z) ?: return null
             val items = HashMap<String, String>()
             val skip = HashSet<String>()
             for (m in Regex("<item\\b[^>]*>", RegexOption.IGNORE_CASE).findAll(opf)) {
                 val tag = m.value
                 val id = Regex("\\bid=\"([^\"]*)\"").find(tag)?.groupValues?.get(1) ?: continue
                 val href = Regex("\\bhref=\"([^\"]*)\"").find(tag)?.groupValues?.get(1) ?: continue
-                val clean = Uri.decode(href.substringBefore('#'))
-                val full = File(if (dir.isEmpty()) clean else "$dir/$clean").normalize().path
-                items[id] = full
+                items[id] = resolvePath(opfPath, href)
                 if (Regex("properties=\"[^\"]*\\bnav\\b").containsMatchIn(tag)) skip.add(id)
             }
             val order = mutableListOf<String>()
@@ -521,7 +761,7 @@ class ConvertService : Service() {
                 val id = Regex("idref=\"([^\"]*)\"").find(m.value)?.groupValues?.get(1) ?: continue
                 if (id in skip) continue
                 val path = items[id] ?: continue
-                if (files.containsKey(path) && !order.contains(path)) order.add(path)
+                if (isHtml(path) && z.getEntry(path) != null && !order.contains(path)) order.add(path)
             }
             return if (order.isEmpty()) null else order
         } catch (e: Exception) {
@@ -529,27 +769,52 @@ class ConvertService : Service() {
         }
     }
 
-    private fun epub(b: ByteArray): List<Pair<String, String>> {
-        val files = LinkedHashMap<String, ByteArray>()
-        ZipInputStream(ByteArrayInputStream(b)).use { z ->
-            var e = z.nextEntry
-            while (e != null) {
-                val n = e.name
-                if (!e.isDirectory && (isHtml(n) || n.lowercase().endsWith(".opf") || n.endsWith("container.xml")))
-                    files[n] = z.readBytes()
-                e = z.nextEntry
+    // Tìm ảnh bìa trong EPUB: cover-image, meta cover, hoặc file có tên chứa "cover"
+    private fun coverOf(z: ZipFile): ByteArray? {
+        try {
+            val (opfPath, opf) = readOpf(z) ?: return null
+            val tags = Regex("<item\\b[^>]*>", RegexOption.IGNORE_CASE).findAll(opf).map { it.value }.toList()
+            fun attr(tag: String, a: String) = Regex("\\b$a=\"([^\"]*)\"").find(tag)?.groupValues?.get(1)
+            var href: String? = tags.firstOrNull { Regex("properties=\"[^\"]*cover-image").containsMatchIn(it) }
+                ?.let { attr(it, "href") }
+            if (href == null) {
+                val meta = Regex("<meta\\b[^>]*>", RegexOption.IGNORE_CASE).findAll(opf).map { it.value }
+                    .firstOrNull { Regex("name=\"cover\"").containsMatchIn(it) }
+                val cid = meta?.let { attr(it, "content") }
+                if (cid != null) href = tags.firstOrNull { attr(it, "id") == cid }?.let { attr(it, "href") }
             }
+            var path = href?.let { resolvePath(opfPath, it) }
+            if (path == null || z.getEntry(path) == null) {
+                path = z.entries().asSequence().map { it.name }.firstOrNull {
+                    val l = it.lowercase()
+                    l.contains("cover") && (l.endsWith(".jpg") || l.endsWith(".jpeg") || l.endsWith(".png"))
+                }
+            }
+            val e = path?.let { z.getEntry(it) } ?: return null
+            return z.getInputStream(e).use { it.readBytes() }
+        } catch (e: Exception) {
+            return null
         }
-        val ordered = spineOrder(files)
-            ?: files.keys.filter { isHtml(it) }.sortedWith { x, y -> naturalCompare(x, y) }
-        val result = mutableListOf<Pair<String, String>>()
-        for (name in ordered) {
-            val data = files[name] ?: continue
-            val t = Html.fromHtml(String(data), Html.FROM_HTML_MODE_LEGACY)
-                .toString().replace("\uFFFC", "")
-            if (t.trim().length > 200) result.add(name to t)
+    }
+
+    // Thu nhỏ ảnh bìa (tối đa ~800px) để mỗi file mp3 không phình to
+    private fun scaleCover(raw: ByteArray?): ByteArray? {
+        if (raw == null) return null
+        try {
+            val o = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeByteArray(raw, 0, raw.size, o)
+            var sample = 1
+            while (maxOf(o.outWidth, o.outHeight) / sample > 800) sample *= 2
+            val bmp = BitmapFactory.decodeByteArray(
+                raw, 0, raw.size, BitmapFactory.Options().apply { inSampleSize = sample }
+            ) ?: return null
+            val bo = ByteArrayOutputStream()
+            bmp.compress(Bitmap.CompressFormat.JPEG, 85, bo)
+            bmp.recycle()
+            return bo.toByteArray()
+        } catch (e: Throwable) {
+            return null
         }
-        return result
     }
 
     private fun chunk(t: String): List<String> {

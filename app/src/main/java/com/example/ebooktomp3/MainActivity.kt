@@ -15,11 +15,16 @@ import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.provider.OpenableColumns
+import android.speech.tts.TextToSpeech
+import android.speech.tts.Voice
+import android.text.Editable
+import android.text.TextWatcher
 import android.text.InputType
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.widget.*
+import java.util.Locale
 
 class MainActivity : Activity() {
     private val BG = Color.parseColor("#F4F6FB")
@@ -42,6 +47,12 @@ class MainActivity : Activity() {
     private lateinit var etLang: EditText
     private lateinit var etGroup: EditText
     private lateinit var etStart: EditText
+    private lateinit var spVoice: Spinner
+    private lateinit var pauseBtn: Button
+    private lateinit var resumeBtn: Button
+    private var tts: TextToSpeech? = null
+    private var ttsReady = false
+    private var voices = listOf<Voice>()
     private lateinit var pageConvert: LinearLayout
     private lateinit var pageList: LinearLayout
     private lateinit var listBox: LinearLayout
@@ -199,6 +210,20 @@ class MainActivity : Activity() {
         c2.addView(label("Ngôn ngữ đọc (vi, en, fr...)", 13f, MUT).apply { setPadding(0, dp(10), 0, dp(4)) })
         etLang = input("vi", false)
         c2.addView(etLang, LinearLayout.LayoutParams(MATCH, WRAP))
+        c2.addView(label("Giọng đọc", 13f, MUT).apply { setPadding(0, dp(14), 0, dp(4)) })
+        spVoice = Spinner(this).apply {
+            background = rounded(Color.parseColor("#F3F4F6"), 10)
+            setPadding(dp(8), dp(6), dp(8), dp(6))
+        }
+        c2.addView(spVoice, LinearLayout.LayoutParams(MATCH, WRAP))
+        val preview = btn("Nghe thử giọng", false, ACC)
+        c2.addView(preview)
+        preview.setOnClickListener { previewVoice() }
+        etLang.addTextChangedListener(object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+            override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+            override fun afterTextChanged(s: Editable?) { refreshVoices() }
+        })
         c2.addView(label("Gộp mỗi bao nhiêu chương thành 1 file mp3", 13f, MUT).apply { setPadding(0, dp(14), 0, dp(4)) })
         etGroup = input("1", true)
         c2.addView(etGroup, LinearLayout.LayoutParams(MATCH, WRAP))
@@ -239,6 +264,9 @@ class MainActivity : Activity() {
         queueBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         queueCard.addView(queueBox)
         queueCard.addView(label("Chạm vào sách đang chờ để bỏ khỏi hàng đợi.", 12f, MUT).apply { setPadding(0, dp(8), 0, 0) })
+        resumeBtn = btn("Tiếp tục hàng đợi", true, ACC).apply { visibility = View.GONE }
+        resumeBtn.setOnClickListener { startForegroundService(Intent(this, ConvertService::class.java)) }
+        queueCard.addView(resumeBtn)
         queueCard.visibility = View.GONE
         body.addView(queueCard)
 
@@ -266,9 +294,10 @@ class MainActivity : Activity() {
         body.addView(c3)
 
         startBtn = btn("Bắt đầu chuyển thành MP3", true, ACC)
+        pauseBtn = btn("Tạm dừng", false, ACC).apply { visibility = View.GONE }
         skipBtn = btn("Bỏ qua sách đang đọc", false, ACC).apply { visibility = View.GONE }
         cancelBtn = btn("Dừng tất cả", false, BAD).apply { visibility = View.GONE }
-        body.addView(startBtn); body.addView(skipBtn); body.addView(cancelBtn)
+        body.addView(startBtn); body.addView(pauseBtn); body.addView(skipBtn); body.addView(cancelBtn)
 
         pick.setOnClickListener {
             startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
@@ -291,16 +320,21 @@ class MainActivity : Activity() {
             val startCh = (etStart.text.toString().trim().toIntOrNull() ?: 1).coerceAtLeast(1)
             val rate = 0.5f + seek.progress * 0.1f
             val t = tree?.toString()
+            val vName = selectedVoiceName()
             val list = pending.map { (u, n) ->
-                BookJob(u.toString(), n, n.substringBeforeLast('.'), lang, group, startCh, rate, t)
+                BookJob(u.toString(), n, n.substringBeforeLast('.'), lang, group, startCh, rate, t, vName)
             }
             pending.clear()
             updatePending()
-            ConvertService.add(list)
+            ConvertService.add(applicationContext, list)
             if (!ConvertService.running)
                 render(Progress(running = true, title = "Đang khởi động...", detail = "", startAt = SystemClock.elapsedRealtime()))
             else renderQueue()
             startForegroundService(Intent(this, ConvertService::class.java))
+        }
+        pauseBtn.setOnClickListener {
+            ConvertService.paused = !ConvertService.paused
+            pauseBtn.text = if (ConvertService.paused) "Tiếp tục" else "Tạm dừng"
         }
         skipBtn.setOnClickListener {
             ConvertService.cancel = true
@@ -331,7 +365,7 @@ class MainActivity : Activity() {
                 JobState.DONE -> "✅" to ""
                 JobState.ERROR -> "⚠️" to " • lỗi: ${j.note}"
                 JobState.CANCELED -> "⛔" to " • đã huỷ"
-                else -> "⏳" to " • đang chờ"
+                else -> "⏳" to (if (j.doneGroups > 0) " • đã xong ${j.doneGroups} file, sẽ làm tiếp" else " • đang chờ")
             }
             val color = when (j.status) {
                 JobState.RUNNING -> ACC
@@ -366,6 +400,10 @@ class MainActivity : Activity() {
         startBtn.text = if (p.running) "Thêm vào hàng đợi" else "Bắt đầu chuyển thành MP3"
         skipBtn.visibility = if (p.running) View.VISIBLE else View.GONE
         cancelBtn.visibility = if (p.running) View.VISIBLE else View.GONE
+        pauseBtn.visibility = if (p.running) View.VISIBLE else View.GONE
+        pauseBtn.text = if (ConvertService.paused) "Tiếp tục" else "Tạm dừng"
+        resumeBtn.visibility =
+            if (!p.running && ConvertService.jobs.any { it.status == JobState.WAITING }) View.VISIBLE else View.GONE
         renderQueue()
         renderList()
     }
@@ -374,6 +412,7 @@ class MainActivity : Activity() {
         synchronized(ConvertService.lock) {
             if (j.status == JobState.WAITING) ConvertService.jobs.remove(j)
         }
+        ConvertService.saveQueue(applicationContext)
         queueSig = ""
         listSig = ""
         renderQueue()
@@ -437,6 +476,56 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun langCode(): String = etLang.text.toString().trim().ifEmpty { "vi" }
+
+    private fun selectedVoiceName(): String? {
+        val pos = spVoice.selectedItemPosition
+        return if (pos > 0 && pos - 1 < voices.size) voices[pos - 1].name else null
+    }
+
+    private fun refreshVoices() {
+        val prev = selectedVoiceName()
+        val t = tts
+        val lang = Locale.forLanguageTag(langCode()).language
+        voices = if (ttsReady && t != null) {
+            try {
+                (t.voices ?: emptySet<Voice>())
+                    .filter {
+                        it.locale.language == lang && !it.isNetworkConnectionRequired &&
+                            it.features?.contains("notInstalled") != true
+                    }
+                    .sortedBy { it.name }
+            } catch (e: Exception) {
+                emptyList()
+            }
+        } else emptyList()
+        val items = mutableListOf("Tự động (giọng mặc định của ngôn ngữ)")
+        items.addAll(voices.map { it.name + (if (it.quality >= Voice.QUALITY_HIGH) " • chất lượng cao" else "") })
+        spVoice.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, items)
+        val idx = voices.indexOfFirst { it.name == prev }
+        spVoice.setSelection(if (idx >= 0) idx + 1 else 0)
+    }
+
+    private fun previewVoice() {
+        val t = tts
+        if (!ttsReady || t == null) {
+            Toast.makeText(this, "Giọng đọc chưa sẵn sàng, thử lại sau vài giây", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val loc = Locale.forLanguageTag(langCode())
+        val r = t.setLanguage(loc)
+        if (r == TextToSpeech.LANG_MISSING_DATA || r == TextToSpeech.LANG_NOT_SUPPORTED) {
+            Toast.makeText(this, "Máy chưa có giọng cho ngôn ngữ này", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val name = selectedVoiceName()
+        if (name != null) voices.firstOrNull { it.name == name }?.let { t.setVoice(it) }
+        t.setSpeechRate(0.5f + seek.progress * 0.1f)
+        val sample = if (loc.language == "vi") "Xin chào, đây là giọng đọc thử của ứng dụng chuyển sách thành mp3."
+        else "Hello, this is a voice preview of the ebook to mp3 app."
+        t.speak(sample, TextToSpeech.QUEUE_FLUSH, null, "preview")
+    }
+
     private fun nameOf(u: Uri): String =
         contentResolver.query(u, null, null, null, null)?.use { c ->
             val idx = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
@@ -451,7 +540,17 @@ class MainActivity : Activity() {
             requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
         setContentView(buildUi())
         ConvertService.loadHistory(this)
+        ConvertService.loadQueue(applicationContext)
         showTab(0)
+        tts = TextToSpeech(this) { st ->
+            ttsReady = st == TextToSpeech.SUCCESS
+            runOnUiThread { refreshVoices() }
+        }
+    }
+
+    override fun onDestroy() {
+        tts?.shutdown()
+        super.onDestroy()
     }
 
     override fun onResume() {
